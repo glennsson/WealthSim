@@ -455,6 +455,16 @@ def render_metrics(
     final_loan = rowN["prop_loan"]
     final_cf   = rowN["cf_val"]
 
+    # ASK-fordel: sammenlign med motsatt scenario
+    if p.get("use_ask", False):
+        _df_no_ask, _, _ = calculate_portfolio({**p, "use_ask": False})
+        ask_delta = final_real - _df_no_ask["real_total"].iloc[-1]
+        ask_label = "ASK-fordel vs. vanlig fond"
+    else:
+        _df_ask, _, _ = calculate_portfolio({**p, "use_ask": True})
+        ask_delta = _df_ask["real_total"].iloc[-1] - final_real
+        ask_label = "Mulig ASK-gevinst"
+
     interest_now     = row0["monthly_interest"]
     interest_final   = rowN["monthly_interest"]
     interest_savings = (interest_now - interest_final) * 12
@@ -471,17 +481,9 @@ def render_metrics(
     c3.metric("Om 15 ar — realverdi",nok(final_real), delta=nok(final_real - today_net))
     c4.metric("Restgjeld om 15 ar",  nok(final_loan), delta=nok(final_loan - p["property_loan"]))
     c5.metric("Akkum. kontantstrom", nok(final_cf))
-    if total_wt > 0:
-        c6.metric("Formuesskatt betalt", nok(total_wt), delta="-kostnad")
-    elif p.get("use_ask", False):
-        c6.metric("ASK", "Aktiv", delta="exit-skatt ar 15")
-    else:
-        usd = p.get("usd_nok_change", 0.0)
-        if usd != 0:
-            sign = "+" if usd > 0 else ""
-            c6.metric("USD/NOK-effekt", f"{sign}{usd:.1f} pp/ar")
-        else:
-            c6.metric("Skatt/valuta", "Standard")
+    ask_icon = "✅" if p.get("use_ask") else "💡"
+    c6.metric(f"{ask_icon} {ask_label}", nok(ask_delta),
+              delta="gevinst over 15 ar" if ask_delta >= 0 else "lavere enn ASK")
 
     # ── Rad 2: break-even ──────────────────────────────────────────────────
     st.markdown("##### Break-even: Eiendom vs. Fond-strategi")
@@ -596,6 +598,85 @@ HIST_DATA = [
 ]
 
 
+def render_sensitivity(p: dict) -> None:
+    """3x3 scenariogrid: fondavkastning (rader) x boligvekst (kolonner)."""
+    with st.expander("🔬 Sensitivitetsanalyse — Total realformue om 15 ar"):
+        st.caption(
+            "Hver celle viser **total netto realformue** (inflasjonsjustert) ved arets slutt "
+            "for ulike kombinasjoner av fondavkastning og boligvekst. "
+            "Den midtre cellen (basis) tilsvarer dine na gjeldende innstillinger."
+        )
+
+        fund_base = p["fund_return"]
+        prop_base = p["property_growth"]
+        fund_deltas = [-2.0, 0.0, 2.0]
+        prop_deltas = [-2.0, 0.0, 2.0]
+
+        col_labels = [f"Bolig {prop_base + d:.1f} %" for d in prop_deltas]
+
+        rows_data = []
+        raw_values = []  # for fargekodig
+        for fd in fund_deltas:
+            row_vals = []
+            for pd_ in prop_deltas:
+                p_t = {**p, "fund_return": fund_base + fd, "property_growth": prop_base + pd_}
+                df_t, _, _ = calculate_portfolio(p_t)
+                row_vals.append(df_t["real_total"].iloc[-1])
+            raw_values.append(row_vals)
+            rows_data.append({
+                "Fondavkastning": f"{fund_base + fd:.1f} %",
+                col_labels[0]: nok(row_vals[0]),
+                col_labels[1]: nok(row_vals[1]),
+                col_labels[2]: nok(row_vals[2]),
+            })
+
+        sens_df = pd.DataFrame(rows_data)
+        st.dataframe(sens_df, width="stretch", hide_index=True)
+
+        # Vis range
+        flat = [v for r in raw_values for v in r]
+        st.caption(
+            f"Spenn: **{nok(min(flat))}** (pessimistisk) — **{nok(max(flat))}** (optimistisk)  |  "
+            f"Basis: **{nok(raw_values[1][1])}**"
+        )
+
+
+def render_cashflow_chart(df: pd.DataFrame) -> None:
+    """Plott maanedlig netto kontantstrom fra eiendommene over tid."""
+    with st.expander("💸 Kontantstrom-tidslinje — maanedlig netto CF per eiendom"):
+        st.caption(
+            "Viser netto maanedlig kontantstrom etter skatt og avdrag. "
+            "Positiv verdi = eiendom betaler seg selv + genererer overskudd."
+        )
+        monthly = df[df["month"] > 0].copy()
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=monthly["date"], y=monthly["prop_net_cf"],
+            name="Bolig 1 — netto CF",
+            marker_color="#3b82f6", opacity=0.85,
+        ))
+        if monthly["prop2_net_cf"].abs().sum() > 0:
+            fig.add_trace(go.Bar(
+                x=monthly["date"], y=monthly["prop2_net_cf"],
+                name="Bolig 2 — netto CF",
+                marker_color="#67e8f9", opacity=0.85,
+            ))
+        fig.add_hline(y=0, line_color="#94a3b8", line_width=1)
+        fig.update_layout(
+            height=320,
+            barmode="stack",
+            xaxis=dict(title="", gridcolor="#1e2535", tickformat="%Y", dtick="M24"),
+            yaxis=dict(title="kr / maned", gridcolor="#1e2535"),
+            legend=dict(orientation="h", y=1.04, x=0),
+            plot_bgcolor="#0b0f19",
+            paper_bgcolor="#0b0f19",
+            font=dict(color="#cbd5e1", size=12),
+            margin=dict(l=70, r=20, t=10, b=40),
+        )
+        st.plotly_chart(fig, width="stretch")
+
+
 def render_historical_context() -> None:
     """Vis historiske referanseverdier som kontekst for brukerens antagelser."""
     with st.expander("📚 Historiske referanseverdier (kontekst for dine antagelser)"):
@@ -661,6 +742,15 @@ def main():
 
     st.markdown("")
     render_yearly_table(df)
+
+    st.markdown("")
+    col_l, col_r = st.columns(2)
+    with col_l:
+        with st.spinner("Beregner sensitivitetsanalyse..."):
+            render_sensitivity(params)
+    with col_r:
+        render_cashflow_chart(df)
+
     render_historical_context()
 
 
