@@ -96,16 +96,16 @@ def calculate_breakeven_rate(p: dict) -> float | None:
     - Returnerer interpolert break-even-rente, eller None hvis ingen krysning.
     """
     fund_params = _fund_scenario_params(p)
-    fund_df, _ = calculate_portfolio(fund_params)
-    fund_total  = fund_df["real_total"].iloc[-1]
+    fund_df, _, _ = calculate_portfolio(fund_params)
+    fund_total    = fund_df["real_total"].iloc[-1]
 
     rates     = [round(i * 0.1, 1) for i in range(20, 101)]  # 2.0 ... 10.0
     prev_diff = None
     prev_rate = None
 
     for rate in rates:
-        p_test     = {**p, "loan_rate": rate}
-        prop_df, _ = calculate_portfolio(p_test)
+        p_test        = {**p, "loan_rate": rate}
+        prop_df, _, _ = calculate_portfolio(p_test)
         prop_total = prop_df["real_total"].iloc[-1]
         diff       = prop_total - fund_total   # positiv = eiendom bedre
 
@@ -122,25 +122,24 @@ def calculate_breakeven_rate(p: dict) -> float | None:
 
 def calculate_portfolio(p: dict) -> tuple:
     """
-    Manedlig simulering over 15 ar med fem aktivaklasser.
+    Manedlig simulering over 15 ar.
 
-    Nyheter vs. v1:
-    - Leieinntekt vokser med KPI arlig: base * (1 + kpi)^(m//12)
-    - 10 % meglergebyr trekkes fra KPI-justert leie for skatteberegning
-    - Positiv netto CF (utleie + utbytte, etter skatt og avdrag) samles i
-      en separat 'cf_val'-posisjon som kompounderes til fondets avkastning
-    - Fondet vokser kun via planlagt manedlig sparing (ingen CF-blanding)
-    - ALLE realverdier deles pa inflation_factor => kjoepekraft i dagens kr
+    Nye features:
+    - use_ask:          utbytte reinvesteres skattefritt; exit-skatt betales ar 15
+    - apply_wealth_tax: formuesskatt 1,1 % pa nettoformue > 1,7 mill. trekkes arlig
+    - usd_nok_change:   justerer fondets effektive avkastning for valutaeksponering
     """
     MONTHS = 15 * 12
 
-    # Effektiv eiendomsvekst justert etter rentenivaa (gjelder begge eiendommer)
     effective_growth  = p["property_growth"] - (p["loan_rate"] - 5.0) * 0.5
     effective_growth2 = p["p2_growth"]       - (p["p2_loan_rate"] - 5.0) * 0.5
 
+    # Feature 7: valutajustering pavirker fondets effektive avkastning
+    eff_fund_return = p["fund_return"] + p.get("usd_nok_change", 0.0)
+
     r_prop   = monthly_rate(effective_growth)
     r_prop2  = monthly_rate(effective_growth2)
-    r_fund   = monthly_rate(p["fund_return"])
+    r_fund   = monthly_rate(eff_fund_return)
     r_stocks = monthly_rate(p["stocks_return"])
     r_alt    = monthly_rate(p["alt_growth"])
     r_inf    = monthly_rate(p["inflation"])
@@ -148,58 +147,90 @@ def calculate_portfolio(p: dict) -> tuple:
     start_ts = pd.Timestamp(date.today().replace(day=1))
     dates    = [start_ts + pd.DateOffset(months=m) for m in range(MONTHS + 1)]
 
-    prop_val   = float(p["property_value"])
-    prop_loan  = float(p["property_loan"])
-    prop2_val  = float(p["p2_value"])
-    prop2_loan = float(p["p2_loan"])
-    fund_val   = float(p["fund_capital"])
-    stocks_val = float(p["stocks_capital"])
-    alt_val    = float(p["alt_capital"])
-    cf_val     = 0.0   # akkumulert kontantstromposisjon (begge eiendommer + utbytte)
+    prop_val        = float(p["property_value"])
+    prop_loan       = float(p["property_loan"])
+    prop2_val       = float(p["p2_value"])
+    prop2_loan      = float(p["p2_loan"])
+    fund_val        = float(p["fund_capital"])
+    stocks_val      = float(p["stocks_capital"])
+    alt_val         = float(p["alt_capital"])
+    # CF delt i to sub-kontoer for ASK-separering
+    cf_rental_val   = 0.0
+    cf_dividend_val = 0.0
+    ask_cost_basis  = 0.0   # sum av bruttouvbytte lagt inn (kostpris ved exit)
+    total_wt        = 0.0   # akkumulert formuesskatt betalt
 
     rows = []
 
     for m in range(MONTHS + 1):
         inflation_factor = (1 + r_inf) ** m
-
-        kpi_factor = (1 + p["inflation"] / 100) ** (m // 12)
+        kpi_factor       = (1 + p["inflation"] / 100) ** (m // 12)
 
         # ── Utleiebolig 1 ──────────────────────────────────────────────────
-        current_rental   = p["rental_income"] * kpi_factor
-        int1             = prop_loan * p["loan_rate"] / 100 / 12
-        taxable1         = current_rental * 0.90 - p["property_fees"] - int1
-        after_tax1       = taxable1 * (1 - SKATT_UTLEIE) if taxable1 > 0 else taxable1
-        prop_net_cf      = after_tax1 - p["monthly_repayment"]
+        current_rental = p["rental_income"] * kpi_factor
+        int1           = prop_loan * p["loan_rate"] / 100 / 12
+        taxable1       = current_rental * 0.90 - p["property_fees"] - int1
+        after_tax1     = taxable1 * (1 - SKATT_UTLEIE) if taxable1 > 0 else taxable1
+        prop_net_cf    = after_tax1 - p["monthly_repayment"]
 
         # ── Utleiebolig 2 ──────────────────────────────────────────────────
-        current_rental2  = p["p2_rental"] * kpi_factor
-        int2             = prop2_loan * p["p2_loan_rate"] / 100 / 12
-        taxable2         = current_rental2 * 0.90 - p["p2_fees"] - int2
-        after_tax2       = taxable2 * (1 - SKATT_UTLEIE) if taxable2 > 0 else taxable2
-        prop2_net_cf     = after_tax2 - p["p2_repayment"]
+        current_rental2 = p["p2_rental"] * kpi_factor
+        int2            = prop2_loan * p["p2_loan_rate"] / 100 / 12
+        taxable2        = current_rental2 * 0.90 - p["p2_fees"] - int2
+        after_tax2      = taxable2 * (1 - SKATT_UTLEIE) if taxable2 > 0 else taxable2
+        prop2_net_cf    = after_tax2 - p["p2_repayment"]
 
-        # ── Arlig utbytte fra enkeltaksjer ─────────────────────────────────
-        dividend_net = 0.0
+        # ── Feature 2: Utbytte — ASK vs. vanlig ───────────────────────────
+        gross_div      = 0.0
+        dividend_to_cf = 0.0
         if m > 0 and m % 12 == 0:
-            dividend_net = stocks_val * p["stocks_dividend"] / 100 * (1 - SKATT_UTBYTTE)
+            gross_div = stocks_val * p["stocks_dividend"] / 100
+            if p.get("use_ask", False):
+                dividend_to_cf  = gross_div              # ingen arlig skatt
+                ask_cost_basis += gross_div              # spor kostpris
+            else:
+                dividend_to_cf = gross_div * (1 - SKATT_UTBYTTE)
 
         # ── Oppdater aktivaverdier ─────────────────────────────────────────
         if m > 0:
-            prop_loan  = max(prop_loan  - p["monthly_repayment"], 0.0)
-            prop2_loan = max(prop2_loan - p["p2_repayment"],       0.0)
-            prop_val   = prop_val  * (1 + r_prop)
-            prop2_val  = prop2_val * (1 + r_prop2)
-            stocks_val = stocks_val * (1 + r_stocks) + p["stocks_monthly"]
-            alt_val    = max(alt_val * (1 + r_alt) - p["alt_costs"], 0.0)
-            fund_val   = fund_val * (1 + r_fund) + p["fund_monthly"]
-            # CF-posisjon: kompounderes + positiv CF fra begge eiendommer + utbytte
-            cf_add  = max(prop_net_cf, 0.0) + max(prop2_net_cf, 0.0) + dividend_net
-            cf_val  = cf_val * (1 + r_fund) + cf_add
+            prop_loan       = max(prop_loan  - p["monthly_repayment"], 0.0)
+            prop2_loan      = max(prop2_loan - p["p2_repayment"],       0.0)
+            prop_val        = prop_val  * (1 + r_prop)
+            prop2_val       = prop2_val * (1 + r_prop2)
+            stocks_val      = stocks_val * (1 + r_stocks) + p["stocks_monthly"]
+            alt_val         = max(alt_val * (1 + r_alt) - p["alt_costs"], 0.0)
+            fund_val        = fund_val * (1 + r_fund) + p["fund_monthly"]
+            cf_rental_val   = cf_rental_val   * (1 + r_fund) + max(prop_net_cf, 0.0) + max(prop2_net_cf, 0.0)
+            cf_dividend_val = cf_dividend_val * (1 + r_fund) + dividend_to_cf
 
         prop_equity  = prop_val  - prop_loan
         prop2_equity = prop2_val - prop2_loan
+        cf_val       = cf_rental_val + cf_dividend_val
 
-        # ── Realverdier: ALLE delt pa inflation_factor ─────────────────────
+        # ── Feature 2: ASK exit-skatt ved siste maned ─────────────────────
+        if m == MONTHS and p.get("use_ask", False) and cf_dividend_val > 0:
+            ask_gain        = max(cf_dividend_val - ask_cost_basis, 0.0)
+            ask_exit_tax    = ask_gain * SKATT_UTBYTTE
+            cf_dividend_val = max(cf_dividend_val - ask_exit_tax, 0.0)
+            cf_val          = cf_rental_val + cf_dividend_val
+
+        # ── Feature 4: Formuesskatt arlig ─────────────────────────────────
+        if p.get("apply_wealth_tax", False) and m > 0 and m % 12 == 0:
+            nettoformue = prop_equity + prop2_equity + fund_val + stocks_val + alt_val + cf_val
+            wt          = max(nettoformue - 1_700_000, 0.0) * 0.011
+            total_wt   += wt
+            # Trekk fra CF forst, deretter fond
+            wt_from_cf  = min(wt, cf_val)
+            cf_val     -= wt_from_cf
+            if cf_rental_val + cf_dividend_val > 0:
+                ratio           = cf_val / (cf_rental_val + cf_dividend_val)
+                cf_rental_val  *= ratio
+                cf_dividend_val *= ratio
+            else:
+                cf_rental_val = cf_dividend_val = 0.0
+            fund_val = max(fund_val - (wt - wt_from_cf), 0.0)
+
+        # ── Realverdier ────────────────────────────────────────────────────
         real_prop   = prop_equity  / inflation_factor
         real_prop2  = prop2_equity / inflation_factor
         real_fund   = fund_val     / inflation_factor
@@ -233,10 +264,11 @@ def calculate_portfolio(p: dict) -> tuple:
             "monthly_interest": int1,
             "prop_net_cf":      prop_net_cf,
             "prop2_net_cf":     prop2_net_cf,
-            "dividend_net":     dividend_net,
+            "dividend_net":     gross_div,
+            "wealth_tax_accum": total_wt,
         })
 
-    return pd.DataFrame(rows), effective_growth
+    return pd.DataFrame(rows), effective_growth, total_wt
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -271,11 +303,12 @@ def build_sidebar() -> dict:
             p2_loan_rate = p2_growth = 0.0
 
     with st.sidebar.expander("📈 Aksjefond", expanded=True):
-        fund_capital = st.number_input("Startkapital (kr)",        value=1_800_000, step=50_000, min_value=0,   key="fk")
-        fund_monthly = st.number_input("Månedlig sparing (kr)",    value=15_000,    step=500,   min_value=0,   key="fm")
+        fund_capital = st.number_input("Startkapital (kr)",     value=1_800_000, step=50_000, min_value=0, key="fk")
+        fund_monthly = st.number_input("Månedlig sparing (kr)", value=15_000,    step=500,   min_value=0, key="fm")
         # Avkastningen er justert for valutaeksponering; vi antar langsiktig
         # nøytral utvikling i USD/NOK (ingen valutagevinst/-tap innbakt).
         fund_return  = st.slider("Avkastning (% p.a.)", min_value=0.0, max_value=15.0, value=3.0, step=0.1, format="%.1f", key="fr")
+        use_ask      = st.checkbox("Bruk ASK (skattefri reinvestering, exit-skatt ar 15)", value=False, key="ask")
 
     with st.sidebar.expander("📊 Enkeltaksjer", expanded=True):
         stocks_capital  = st.number_input("Startkapital (kr)",              value=200_000, step=10_000, min_value=0,   key="sk")
@@ -289,7 +322,10 @@ def build_sidebar() -> dict:
         alt_costs   = st.number_input("Løpende kostnader (kr/mnd)",  value=1_000,   step=100,   min_value=0,   key="ac")
 
     with st.sidebar.expander("🌍 Makro", expanded=True):
-        inflation = st.number_input("Inflasjon / KPI (% p.a.)", value=2.1, step=0.1, format="%.1f", key="inf")
+        inflation        = st.number_input("Inflasjon / KPI (% p.a.)", value=2.1, step=0.1, format="%.1f", key="inf")
+        # Positiv verdi = USD styrker seg mot NOK => fondets NOK-avkastning oker
+        usd_nok_change   = st.slider("USD/NOK arlig endring (pp)", min_value=-5.0, max_value=5.0, value=0.0, step=0.1, format="%.1f", key="usdnok")
+        apply_wealth_tax = st.checkbox("Beregn formuesskatt (1,1 % over 1,7 mill. kr)", value=False, key="wt")
 
     st.sidebar.markdown("---")
     st.sidebar.caption(
@@ -310,11 +346,14 @@ def build_sidebar() -> dict:
         p2_growth=p2_growth,
         # Fond og aksjer
         fund_capital=fund_capital,       fund_monthly=fund_monthly,
-        fund_return=fund_return,         stocks_capital=stocks_capital,
-        stocks_monthly=stocks_monthly,   stocks_return=stocks_return,
-        stocks_dividend=stocks_dividend, alt_capital=alt_capital,
-        alt_growth=alt_growth,           alt_costs=alt_costs,
-        inflation=inflation,
+        fund_return=fund_return,         use_ask=use_ask,
+        stocks_capital=stocks_capital,   stocks_monthly=stocks_monthly,
+        stocks_return=stocks_return,     stocks_dividend=stocks_dividend,
+        alt_capital=alt_capital,         alt_growth=alt_growth,
+        alt_costs=alt_costs,
+        # Makro
+        inflation=inflation,             usd_nok_change=usd_nok_change,
+        apply_wealth_tax=apply_wealth_tax,
     )
 
 
@@ -404,6 +443,7 @@ def render_metrics(
     p: dict,
     effective_growth: float,
     breakeven_rate: float | None,
+    total_wt: float = 0.0,
 ) -> None:
     """Vis nokkeltall, break-even og kontantstrom-forklaring."""
     row0 = df.iloc[0]
@@ -425,12 +465,23 @@ def render_metrics(
     rental_final = rowN["current_rental"]
 
     # ── Rad 1: portefoljenokler ────────────────────────────────────────────
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Nettoformue i dag",   nok(today_net))
     c2.metric("Om 15 ar — nominell", nok(final_nom),  delta=nok(final_nom  - today_net))
     c3.metric("Om 15 ar — realverdi",nok(final_real), delta=nok(final_real - today_net))
     c4.metric("Restgjeld om 15 ar",  nok(final_loan), delta=nok(final_loan - p["property_loan"]))
     c5.metric("Akkum. kontantstrom", nok(final_cf))
+    if total_wt > 0:
+        c6.metric("Formuesskatt betalt", nok(total_wt), delta="-kostnad")
+    elif p.get("use_ask", False):
+        c6.metric("ASK", "Aktiv", delta="exit-skatt ar 15")
+    else:
+        usd = p.get("usd_nok_change", 0.0)
+        if usd != 0:
+            sign = "+" if usd > 0 else ""
+            c6.metric("USD/NOK-effekt", f"{sign}{usd:.1f} pp/ar")
+        else:
+            c6.metric("Skatt/valuta", "Standard")
 
     # ── Rad 2: break-even ──────────────────────────────────────────────────
     st.markdown("##### Break-even: Eiendom vs. Fond-strategi")
@@ -440,9 +491,9 @@ def render_metrics(
 
     if breakeven_rate is None:
         # Avgjor hvilken strategi som vinner utenfor intervallet
-        fund_params = _fund_scenario_params(p)
-        fund_df, _  = calculate_portfolio(fund_params)
-        fund_total  = fund_df["real_total"].iloc[-1]
+        fund_params    = _fund_scenario_params(p)
+        fund_df, _, _  = calculate_portfolio(fund_params)
+        fund_total     = fund_df["real_total"].iloc[-1]
         prop_total  = rowN["real_total"]
 
         prop_wins = prop_total > fund_total
@@ -532,6 +583,31 @@ def render_yearly_table(df: pd.DataFrame) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# HISTORISKE REFERANSEVERDIER
+# ─────────────────────────────────────────────────────────────────────────────
+
+HIST_DATA = [
+    {"Aktivaklasse": "Oslo Bors (OSEBX)",        "Periode": "1996–2025", "Snitt p.a.": "10,2 %", "Verste ar":    "-54 % (2008)"},
+    {"Aktivaklasse": "Norske boligpriser",        "Periode": "2000–2025", "Snitt p.a.":  "6,8 %", "Verste ar":    "-12 % (2022)"},
+    {"Aktivaklasse": "MSCI World (NOK-hedget)",   "Periode": "2000–2025", "Snitt p.a.":  "8,9 %", "Verste ar":    "-40 % (2008)"},
+    {"Aktivaklasse": "Norsk inflasjon (KPI)",     "Periode": "2000–2025", "Snitt p.a.":  "2,4 %", "Verste ar":    "7,5 % (2022)"},
+    {"Aktivaklasse": "Statsobligasjoner 10Y",     "Periode": "2000–2025", "Snitt p.a.":  "3,8 %", "Verste ar":    "-10 % (2022)"},
+    {"Aktivaklasse": "Global eiendom (REIT)",     "Periode": "2000–2025", "Snitt p.a.":  "7,1 %", "Verste ar":    "-60 % (2008)"},
+]
+
+
+def render_historical_context() -> None:
+    """Vis historiske referanseverdier som kontekst for brukerens antagelser."""
+    with st.expander("📚 Historiske referanseverdier (kontekst for dine antagelser)"):
+        st.caption(
+            "Historisk avkastning er ingen garanti for fremtidig avkastning. "
+            "Tallene er nominelle og inkluderer ikke kostnader eller skatt."
+        )
+        hist_df = pd.DataFrame(HIST_DATA)
+        st.dataframe(hist_df, width="stretch", hide_index=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -544,10 +620,25 @@ def main():
 
     st.markdown("""
     <style>
-        [data-testid="stMetricValue"]  { font-size: 1.35rem !important; font-weight: 700; }
-        [data-testid="stMetricDelta"]  { font-size: 0.85rem !important; }
-        [data-testid="stMetricLabel"]  { font-size: 0.80rem !important; color: #94a3b8; }
-        .block-container               { padding-top: 2rem; }
+        [data-testid="stMetricValue"]  { font-size: 1.25rem !important; font-weight: 700; }
+        [data-testid="stMetricDelta"]  { font-size: 0.82rem !important; }
+        [data-testid="stMetricLabel"]  { font-size: 0.78rem !important; color: #94a3b8; }
+        .block-container               { padding-top: 1.5rem; }
+
+        /* Mobil-tilpasning */
+        @media (max-width: 640px) {
+            [data-testid="stMetricValue"] { font-size: 0.95rem !important; }
+            [data-testid="stMetricLabel"] { font-size: 0.70rem !important; }
+            .block-container {
+                padding-left: 0.5rem !important;
+                padding-right: 0.5rem !important;
+            }
+            [data-testid="column"] { padding: 0.1rem !important; }
+            h1 { font-size: 1.4rem !important; }
+        }
+        @media (max-width: 480px) {
+            [data-testid="stMetricValue"] { font-size: 0.82rem !important; }
+        }
     </style>
     """, unsafe_allow_html=True)
 
@@ -558,7 +649,7 @@ def main():
     )
 
     params = build_sidebar()
-    df, effective_growth = calculate_portfolio(params)
+    df, effective_growth, total_wt = calculate_portfolio(params)
 
     st.subheader("Porteføljeutvikling — Netto realverdi per aktivaklasse")
     render_chart(df)
@@ -566,10 +657,11 @@ def main():
     st.subheader("Nøkkeltall")
     with st.spinner("Beregner break-even..."):
         breakeven_rate = calculate_breakeven_rate(params)
-    render_metrics(df, params, effective_growth, breakeven_rate)
+    render_metrics(df, params, effective_growth, breakeven_rate, total_wt)
 
     st.markdown("")
     render_yearly_table(df)
+    render_historical_context()
 
 
 if __name__ == "__main__":
