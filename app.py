@@ -273,7 +273,10 @@ def build_sidebar() -> dict:
     with st.sidebar.expander("📈 Aksjefond", expanded=True):
         fund_capital = st.number_input("Startkapital (kr)",        value=1_800_000, step=50_000, min_value=0,   key="fk")
         fund_monthly = st.number_input("Månedlig sparing (kr)",    value=15_000,    step=500,   min_value=0,   key="fm")
-        fund_return  = st.number_input("Avkastning (% p.a.)",      value=7.0,       step=0.1,   format="%.1f", key="fr")
+        # 6.3 % basert på 2026-estimater for globale aksjer (MSCI World m.fl.).
+        # Avkastningen er justert for valutaeksponering; vi antar langsiktig
+        # nøytral utvikling i USD/NOK (ingen valutagevinst/-tap innbakt).
+        fund_return  = st.number_input("Avkastning (% p.a.)",      value=6.3,       step=0.1,   format="%.1f", key="fr")
 
     with st.sidebar.expander("📊 Enkeltaksjer", expanded=True):
         stocks_capital  = st.number_input("Startkapital (kr)",              value=200_000, step=10_000, min_value=0,   key="sk")
@@ -287,7 +290,7 @@ def build_sidebar() -> dict:
         alt_costs   = st.number_input("Løpende kostnader (kr/mnd)",  value=1_000,   step=100,   min_value=0,   key="ac")
 
     with st.sidebar.expander("🌍 Makro", expanded=True):
-        inflation = st.number_input("Inflasjon / KPI (% p.a.)", value=2.5, step=0.1, format="%.1f", key="inf")
+        inflation = st.number_input("Inflasjon / KPI (% p.a.)", value=2.1, step=0.1, format="%.1f", key="inf")
 
     st.sidebar.markdown("---")
     st.sidebar.caption(
