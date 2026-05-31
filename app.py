@@ -254,7 +254,7 @@ def build_sidebar() -> dict:
         monthly_repayment = st.number_input("Månedlig avdrag (kr/mnd)",     value=10_000,    step=500,     min_value=0,   key="mr")
         property_fees     = st.number_input("Felleskostnader (kr/mnd)",     value=2_360,     step=100,     min_value=0,   key="pf")
         rental_income     = st.number_input("Leieinntekt (kr/mnd)",         value=18_000,    step=500,     min_value=0,   key="ri")
-        property_growth   = st.number_input("Prisvekst eiendom (% p.a.)",   value=3.0,       step=0.1,     format="%.1f", key="pg")
+        property_growth   = st.number_input("Prisvekst eiendom (% p.a.)",   value=2.5,       step=0.1,     format="%.1f", key="pg")
 
     with st.sidebar.expander("🏠 Utleiebolig 2", expanded=False):
         include_prop2 = st.checkbox("Aktiver utleiebolig 2", value=False, key="inc2")
