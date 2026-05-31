@@ -6,6 +6,7 @@ Beregner netto realverdi for fire aktivaklasser over 15 år.
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import date
 
 
@@ -120,11 +121,22 @@ def calculate_breakeven_rate(p: dict) -> float | None:
     return None   # ingen krysning funnet i 2–10 % intervallet
 
 
+@st.cache_data(show_spinner=False)
+def _calculate_portfolio_cached(p_items: tuple) -> tuple:
+    """Cachebar inner-funksjon — kall calculate_portfolio() i stedet."""
+    return _calculate_portfolio_core(dict(p_items))
+
+
 def calculate_portfolio(p: dict) -> tuple:
+    """Public API: konverterer dict til hashbar tuple og bruker cache."""
+    return _calculate_portfolio_cached(tuple(sorted(p.items())))
+
+
+def _calculate_portfolio_core(p: dict) -> tuple:
     """
     Manedlig simulering over 15 ar.
 
-    Nye features:
+    Features:
     - use_ask:          utbytte reinvesteres skattefritt; exit-skatt betales ar 15
     - apply_wealth_tax: formuesskatt 1,1 % pa nettoformue > 1,7 mill. trekkes arlig
     - usd_nok_change:   justerer fondets effektive avkastning for valutaeksponering
@@ -269,6 +281,7 @@ def calculate_portfolio(p: dict) -> tuple:
         })
 
     return pd.DataFrame(rows), effective_growth, total_wt
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -438,6 +451,73 @@ def render_chart(df: pd.DataFrame) -> None:
     st.plotly_chart(fig, width="stretch")
 
 
+def render_allocation_chart(df: pd.DataFrame) -> None:
+    """Donut-chart: porteføljefordeling i dag vs. om 15 år (realverdi)."""
+    PALETTE = ["#3B82F6", "#0EA5E9", "#22C55E", "#F59E0B", "#A855F7", "#F43F5E"]
+    LABELS  = ["Utleiebolig 1", "Utleiebolig 2", "Aksjefond",
+               "Enkeltaksjer", "Alternativt", "Kontantstr."]
+
+    row0 = df.iloc[0]
+    rowN = df.iloc[-1]
+
+    now_raw = [
+        max(float(row0["prop_equity"]),  0),
+        max(float(row0["prop2_equity"]), 0),
+        max(float(row0["fund_val"]),     0),
+        max(float(row0["stocks_val"]),   0),
+        max(float(row0["alt_val"]),      0),
+        max(float(row0["cf_val"]),       0),
+    ]
+    yr15_raw = [
+        max(float(rowN["real_prop"]),   0),
+        max(float(rowN["real_prop2"]),  0),
+        max(float(rowN["real_fund"]),   0),
+        max(float(rowN["real_stocks"]), 0),
+        max(float(rowN["real_alt"]),    0),
+        max(float(rowN["real_cf"]),     0),
+    ]
+
+    # Filtrer ut nullverdier slik at de ikke forurenser legendene
+    def filtered(vals):
+        return [(lbl, v, clr) for lbl, v, clr in zip(LABELS, vals, PALETTE) if v > 0]
+
+    now_f  = filtered(now_raw)
+    yr15_f = filtered(yr15_raw)
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        specs=[[{"type": "pie"}, {"type": "pie"}]],
+        subplot_titles=["I dag — nominell", "Om 15 ar — realverdi"],
+    )
+    fig.add_trace(go.Pie(
+        labels=[item[0] for item in now_f],
+        values=[item[1] for item in now_f],
+        marker_colors=[item[2] for item in now_f],
+        hole=0.46,
+        textinfo="percent",
+        hovertemplate="<b>%{label}</b><br>%{value:,.0f} kr<br>%{percent}<extra></extra>",
+        showlegend=True,
+    ), 1, 1)
+    fig.add_trace(go.Pie(
+        labels=[item[0] for item in yr15_f],
+        values=[item[1] for item in yr15_f],
+        marker_colors=[item[2] for item in yr15_f],
+        hole=0.46,
+        textinfo="percent",
+        hovertemplate="<b>%{label}</b><br>%{value:,.0f} kr<br>%{percent}<extra></extra>",
+        showlegend=False,
+    ), 1, 2)
+    fig.update_layout(
+        height=310,
+        plot_bgcolor="#0b0f19",
+        paper_bgcolor="#0b0f19",
+        font=dict(color="#cbd5e1", size=12),
+        margin=dict(l=20, r=20, t=40, b=10),
+        legend=dict(orientation="h", y=-0.05, x=0.5, xanchor="center"),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+
 def render_metrics(
     df: pd.DataFrame,
     p: dict,
@@ -578,10 +658,20 @@ def render_yearly_table(df: pd.DataFrame) -> None:
             "Alternativt (real)", "Kontantstrom (real)", "Total realverdi", "Total nominell",
         ]
 
+        # Lagre råverdier for CSV-eksport FØR nok()-formatering
+        csv_bytes = tbl.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
+
         for col in tbl.columns[1:]:
             tbl[col] = tbl[col].apply(nok)
 
         st.dataframe(tbl, width="stretch", hide_index=True)
+        st.download_button(
+            "⬇️ Last ned som CSV",
+            data=csv_bytes,
+            file_name="formuesimulator.csv",
+            mime="text/csv",
+            use_container_width=False,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -734,6 +824,13 @@ def main():
 
     st.subheader("Porteføljeutvikling — Netto realverdi per aktivaklasse")
     render_chart(df)
+
+    chart_col, alloc_col = st.columns([3, 2])
+    with chart_col:
+        st.caption("Tidslinje vist over. Se sensitivitetsanalyse og kontantstrøm-tidslinje lenger ned.")
+    with alloc_col:
+        st.markdown("**Porteføljefordeling**")
+        render_allocation_chart(df)
 
     st.subheader("Nøkkeltall")
     with st.spinner("Beregner break-even..."):
