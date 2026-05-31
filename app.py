@@ -334,11 +334,14 @@ def build_sidebar() -> dict:
         alt_growth  = st.number_input("Verdiøkning (% p.a.)",        value=4.0,     step=0.1,   format="%.1f", key="ag")
         alt_costs   = st.number_input("Løpende kostnader (kr/mnd)",  value=1_000,   step=100,   min_value=0,   key="ac")
 
-    with st.sidebar.expander("🌍 Makro", expanded=True):
+    with st.sidebar.expander("🌍 Makro & FIRE", expanded=True):
         inflation        = st.number_input("Inflasjon / KPI (% p.a.)", value=2.1, step=0.1, format="%.1f", key="inf")
         # Positiv verdi = USD styrker seg mot NOK => fondets NOK-avkastning oker
         usd_nok_change   = st.slider("USD/NOK arlig endring (pp)", min_value=-5.0, max_value=5.0, value=0.0, step=0.1, format="%.1f", key="usdnok")
         apply_wealth_tax = st.checkbox("Beregn formuesskatt (1,1 % over 1,7 mill. kr)", value=False, key="wt")
+        st.markdown("---")
+        fire_monthly     = st.number_input("Onsket passivinntekt (kr/mnd)", value=50_000, step=5_000, min_value=0, key="fire",
+                                           help="FIRE-kalkulator: 4%-regelen beregner nar portefoljen din dekker dette beloppet")
 
     st.sidebar.markdown("---")
     st.sidebar.caption(
@@ -364,9 +367,9 @@ def build_sidebar() -> dict:
         stocks_return=stocks_return,     stocks_dividend=stocks_dividend,
         alt_capital=alt_capital,         alt_growth=alt_growth,
         alt_costs=alt_costs,
-        # Makro
+        # Makro & FIRE
         inflation=inflation,             usd_nok_change=usd_nok_change,
-        apply_wealth_tax=apply_wealth_tax,
+        apply_wealth_tax=apply_wealth_tax, fire_monthly=fire_monthly,
     )
 
 
@@ -767,6 +770,89 @@ def render_cashflow_chart(df: pd.DataFrame) -> None:
         st.plotly_chart(fig, width="stretch")
 
 
+def render_fire_row(df: pd.DataFrame, p: dict) -> None:
+    """FIRE-kalkulator: 4 %-regelen og passivinntektspunkt."""
+    fire_monthly = p.get("fire_monthly", 50_000)
+    fire_number  = fire_monthly * 12 / 0.04      # portefolje nodvendig ved 4 %-uttak
+
+    passive_at_15   = df.iloc[-1]["real_total"] * 0.04 / 12   # maanedlig ved ar 15
+    fire_row        = df[df["real_total"] >= fire_number]
+    fire_in_horizon = not fire_row.empty
+
+    if fire_in_horizon:
+        fire_month = int(fire_row["month"].iloc[0])
+        fire_years = fire_month / 12
+        fire_label = f"Om {fire_years:.1f} ar"
+        fire_delta = f"Noer FIRE-punktet ({nok(fire_number)} nodvendig)"
+    else:
+        gap        = fire_number - df.iloc[-1]["real_total"]
+        fire_label = "Utover 15-arshorisont"
+        fire_delta = f"Mangler {nok(gap)} ved ar 15"
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Maanedlig passivinntekt om 15 ar (4 %-regel)", nok(int(passive_at_15)))
+    c2.metric("FIRE-tall (nodvendig portefolje)", nok(int(fire_number)))
+    c3.metric("FIRE-punkt naas", fire_label, delta=fire_delta,
+              delta_color="normal" if fire_in_horizon else "inverse")
+
+
+def render_insights(
+    df: pd.DataFrame,
+    p: dict,
+    effective_growth: float,
+    breakeven_rate: float | None,
+    total_wt: float,
+) -> None:
+    """Automatisk genererte noekkelin nsikter basert pa simuleringsresultater."""
+    row0       = df.iloc[0]
+    rowN       = df.iloc[-1]
+    today_net  = row0["nominal_total"]
+    final_real = rowN["real_total"]
+    growth_pct = (final_real / today_net - 1) * 100 if today_net > 0 else 0
+
+    lines = []
+
+    # Vekst
+    if growth_pct >= 100:
+        lines.append(f"Portefoljen din **mer enn dobler seg** i realverdi over 15 ar ({growth_pct:.0f} % vekst).")
+    elif growth_pct >= 0:
+        lines.append(f"Portefoljen din vokser **{growth_pct:.0f} %** i realverdi over 15 ar.")
+    else:
+        lines.append(f"Portefoljen din *taper* {abs(growth_pct):.0f} % i realverdi — vurder hoyere sparerate eller avkastning.")
+
+    # Break-even
+    if breakeven_rate is not None:
+        diff = breakeven_rate - p["loan_rate"]
+        if diff > 0:
+            lines.append(f"Eiendomsstrategien er gunstig: du er **{diff:.1f} pp under break-even-renten** ({breakeven_rate:.1f} %).")
+        else:
+            lines.append(f"Fondstrategien er gunstigere: laanerenten din er **{abs(diff):.1f} pp over break-even** ({breakeven_rate:.1f} %).")
+    else:
+        lines.append("Eiendomsstrategien er gunstigere enn fondstrategien gjennom hele 2–10 %-intervallet.")
+
+    # ASK
+    _p_ask = {**p, "use_ask": not p.get("use_ask", False)}
+    _df_alt, _, _ = calculate_portfolio(_p_ask)
+    ask_delta = abs(final_real - _df_alt["real_total"].iloc[-1])
+    if p.get("use_ask"):
+        lines.append(f"ASK gir deg **{nok(int(ask_delta))} mer** enn vanlig fond ved ar 15.")
+    else:
+        lines.append(f"Ved a bruke ASK kan du faa **{nok(int(ask_delta))} ekstra** ved ar 15.")
+
+    # Formuesskatt
+    if total_wt > 0:
+        lines.append(f"Formueskatten koster deg **{nok(int(total_wt))}** over perioden — vurder skatteraadgivning.")
+
+    # Kontantstrom
+    final_cf_monthly = rowN["prop_net_cf"]
+    if final_cf_monthly > 0:
+        lines.append(f"Utleieboligen genererer **{nok(int(final_cf_monthly))}/mnd** i netto overskudd ved ar 15.")
+    elif final_cf_monthly < 0:
+        lines.append(f"Utleieboligen har negativt netto CF paa {nok(int(abs(final_cf_monthly)))}/mnd ved ar 15 — vurder refinansiering.")
+
+    st.markdown("\n".join(f"- {line}" for line in lines))
+
+
 def render_historical_context() -> None:
     """Vis historiske referanseverdier som kontekst for brukerens antagelser."""
     with st.expander("📚 Historiske referanseverdier (kontekst for dine antagelser)"):
@@ -815,40 +901,59 @@ def main():
 
     st.title("📊 Formuesimulator")
     st.caption(
-        "Beregn netto realformue 15 år frem i tid — inflasjonsjustert og skattekorrigert, "
-        "med automatisk reinvestering av positiv kontantstrøm."
+        "Beregn netto realformue 15 ar frem i tid — inflasjonsjustert og skattekorrigert, "
+        "med automatisk reinvestering av positiv kontantstrom."
     )
 
     params = build_sidebar()
     df, effective_growth, total_wt = calculate_portfolio(params)
 
-    st.subheader("Porteføljeutvikling — Netto realverdi per aktivaklasse")
+    # ── 1. Portefoljeutvikling ────────────────────────────────────────────────
+    st.subheader("Portefoljeutvikling — Netto realverdi per aktivaklasse")
     render_chart(df)
 
-    chart_col, alloc_col = st.columns([3, 2])
-    with chart_col:
-        st.caption("Tidslinje vist over. Se sensitivitetsanalyse og kontantstrøm-tidslinje lenger ned.")
-    with alloc_col:
-        st.markdown("**Porteføljefordeling**")
-        render_allocation_chart(df)
-
-    st.subheader("Nøkkeltall")
-    with st.spinner("Beregner break-even..."):
+    # ── 2. Nokkeltall ────────────────────────────────────────────────────────
+    st.subheader("Nokkeltall")
+    with st.spinner("Beregner break-even og ASK-sammenligning..."):
         breakeven_rate = calculate_breakeven_rate(params)
     render_metrics(df, params, effective_growth, breakeven_rate, total_wt)
 
-    st.markdown("")
+    # ── 3. Innsikt + allokering (to kolonner) ────────────────────────────────
+    st.markdown("---")
+    ins_col, alloc_col = st.columns([3, 2])
+    with ins_col:
+        st.markdown("**Noekkelin nsikter**")
+        render_insights(df, params, effective_growth, breakeven_rate, total_wt)
+    with alloc_col:
+        st.markdown("**Portefoljefording**")
+        render_allocation_chart(df)
+
+    # ── 4. FIRE-kalkulator ────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Fri okonomi — FIRE-kalkulator (4 %-regelen)")
+    render_fire_row(df, params)
+
+    # ── 5. Detaljer (ekspanderbare) ───────────────────────────────────────────
+    st.markdown("---")
     render_yearly_table(df)
 
-    st.markdown("")
-    col_l, col_r = st.columns(2)
-    with col_l:
+    bot_l, bot_r = st.columns(2)
+    with bot_l:
         with st.spinner("Beregner sensitivitetsanalyse..."):
             render_sensitivity(params)
-    with col_r:
+    with bot_r:
         render_cashflow_chart(df)
 
     render_historical_context()
+
+    # ── 6. Footer ──────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.caption(
+        "Formuesimulator er kun ment som et illustrasjonsverktoey og utgjor ikke "
+        "finansiell radgivning. Alle beregninger er basert pa brukerens egne forutsetninger "
+        "og historiske data som ikke garanterer fremtidig avkastning. "
+        "Skatteregler kan endres. Konsulter en autorisert finansradgiver for personlig radgivning."
+    )
 
 
 if __name__ == "__main__":
